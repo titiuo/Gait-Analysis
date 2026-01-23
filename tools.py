@@ -1,0 +1,963 @@
+#####################################################################
+#                                                                   #
+#                           IMPORT                                  #
+#                                                                   #
+#####################################################################
+
+# PyTorch de base
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import grad
+
+# Numpy pour manipulations classiques
+import numpy as np
+import math
+
+# Pour visualiser les signaux et atomes
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+# Pour charger et manipuler des données
+import pandas as pd
+import json
+import os
+import tarfile
+from urllib.request import urlretrieve
+from scipy.signal import butter, filtfilt, welch
+from scipy import interpolate
+from typing import Tuple, List
+
+from data import get_gait_cycle_indices
+
+#####################################################################
+#                                                                   #
+#                           Helpers                                 #
+#                                                                   #
+#####################################################################
+
+def orthogonalize_phi(phi):
+    """
+    Orthogonalise les atomes entre eux et normalise chacun.
+    phi: (K, L, P)
+    """
+    K, L, P = phi.shape
+    phi_flat = phi.reshape(K, L*P).clone()
+    
+    # Gram-Schmidt classique
+    for i in range(K):
+        for j in range(i):
+            proj = (phi_flat[i] @ phi_flat[j]) / (phi_flat[j] @ phi_flat[j])
+            phi_flat[i] = phi_flat[i] - proj * phi_flat[j]
+        # Normalisation
+        norm_i = phi_flat[i].norm()
+        if norm_i > 0:
+            phi_flat[i] = phi_flat[i] / norm_i
+        else:
+            # au cas où l'atome est nul, on le laisse tel quel
+            phi_flat[i] = phi_flat[i]
+    
+    phi_ortho = phi_flat.reshape(K, L, P)
+    return phi_ortho
+
+
+
+def to_tensor(x, device, requires_grad: bool = False, dtype=torch.float32):
+    """Safe wrapping to tensor without copy-construct warnings."""
+    if torch.is_tensor(x):
+        t = x.detach().clone().to(device=device, dtype=dtype)
+        t.requires_grad_(requires_grad)
+        return t
+    t = torch.as_tensor(x, dtype=dtype, device=device)
+    t.requires_grad_(requires_grad)
+    return t
+
+def unit_norm_atoms_(phi, eps=1e-12):
+    """Project each atom (K,L,P) to unit l2 norm."""
+    K = phi.shape[0]
+    flat = phi.view(K, -1)
+    norms = torch.linalg.vector_norm(flat, dim=1, keepdim=True).clamp_min_(eps)
+    phi.copy_((flat / norms).view_as(phi))
+    return phi
+
+
+def reconstruct_from_Z_phi(Z, phi, N=None):
+    """
+    Reconstruction du signal X_hat = phi * Z en utilisant la Transposée de Convolution.
+    
+    Z:   (S, K, T) 
+    phi: (K, L, P)
+    returns X_hat: (S, N, P)
+    """
+    S, K, T = Z.shape
+    K2, L, P = phi.shape
+    assert K2 == K
+    if N is None:
+        N = T + L - 1
+    
+    weight_transpose = phi.permute(0, 2, 1).contiguous() 
+    
+    y = F.conv_transpose1d(
+        Z,                           # Input: (S, K, T)
+        weight_transpose,            # Weight: (K, P, L) 
+        padding=0
+    )
+    
+    if y.shape[2] > N:
+         y = y[..., :N]
+    
+    return y.permute(0, 2, 1)                         
+
+
+#####################################################################
+#                                                                   #
+#                           Initialization                          #
+#                                                                   #
+#####################################################################
+
+def setInitialValues(X,K,M,L):
+    """
+    Set initial values for the parameters of PerCDL.
+
+    Parameters:
+    - K: number of common atoms in the dictionary
+    - L: length of each atom (number of time samples)
+    - P: number of signal dimensions (e.g., sensors or channels)
+    - S: number of signals (patients or trials)
+
+    Returns:
+    - Phi: initial common dictionary (K x L x P)
+    - Z: initial activations (S x K x N-L+1, initialized later)
+    - A: initial personalization parameters (S x K x M)
+    """
+    S, N, P = X.shape  
+    Phi = torch.randn(K, L, P) * 1.0
+    Phi = unit_norm_atoms_(Phi)
+    Z = torch.rand(S, K, N-L+1) * 0.01
+    A = torch.zeros(S, K, M)
+
+    return Phi, Z, A
+
+def setInitialValues_pers(
+    X: np.ndarray, 
+    K: int, 
+    M: int, 
+    L: int, 
+    signal_names: List[str],
+    patterns_filepath: str = "patterns_bruts_sujet_1_essai_1.json",
+    seed: int = 42
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Set initial values for PerCDL parameters using raw JSON patterns.
+    Generalized for any number of channels (P) provided via signal_names.
+
+    Parameters:
+    - X: Signal data (S x N x P)
+    - K: Number of common atoms in the dictionary.
+    - M: Number of personalization components.
+    - L: Length of each atom (time samples).
+    - signal_names: List of strings matching the channels in X (e.g., ['RAV', 'RAZ', 'RRY']).
+    - patterns_filepath: Path to the JSON file containing raw patterns.
+    - seed: Random seed for reproducibility.
+
+    Returns:
+    - Phi: Initial common dictionary (K x L x P)
+    - Z: Initial activations (S x K x N-L+1)
+    - A: Initial personalization parameters (S x K x M)
+    """
+    
+    # 1. Determine dimensions
+    # S: Subjects, N: Time points, P: Channels
+    S, N, P = X.shape  
+    
+    # Validation: Ensure signal_names matches data dimension P
+    if len(signal_names) != P:
+        raise ValueError(f"Length of signal_names ({len(signal_names)}) must match number of channels in X (P={P}).")
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    # 2. Load and Extract Raw Patterns
+    try:
+        with open(patterns_filepath, 'r') as f:
+            raw_patterns = json.load(f)
+    except FileNotFoundError:
+        print(f"⚠️ File not found: {patterns_filepath}. Initializing Phi randomly.")
+        Phi = torch.randn(K, L, P)
+        Phi = unit_norm_atoms_(Phi)
+    else:
+        # Initialize Phi tensor (K x L x P)
+        Phi_init_tensor = torch.zeros(K, L, P)
+        
+        # Define suffixes for patterns (assuming JSON keys are like 'SignalName_Right' or 'SignalName_Left')
+        # If K > 2, this will cycle: Atom 0->Right, Atom 1->Left, Atom 2->Right...
+        cycle_suffixes = ['Right', 'Left']
+
+        # Loop over Atoms (K)
+        for k_idx in range(K):
+            # Determine if this atom represents Right or Left based on index
+            current_suffix = cycle_suffixes[k_idx % len(cycle_suffixes)]
+            
+            # Loop over Channels (P) using the provided names
+            for p_idx, channel_name in enumerate(signal_names):
+                
+                # Construct the key expected in the JSON (e.g., "RAV_Right")
+                key = f'{channel_name}_{current_suffix}'
+                
+                if key in raw_patterns and raw_patterns[key]:
+                    # Convert list to numpy array
+                    pattern_raw = np.array(raw_patterns[key])
+                    
+                    # 3. Resampling / Interpolation to length L
+                    if pattern_raw.size >= 2:
+                        # Cubic interpolation function
+                        time_raw = np.arange(pattern_raw.size)
+                        f_interp = interpolate.interp1d(time_raw, pattern_raw, kind='cubic')
+                        
+                        # Resample to new length L
+                        time_new = np.linspace(0, pattern_raw.size - 1, L)
+                        pattern_resampled = f_interp(time_new)
+                        
+                        # Assign to Tensor
+                        Phi_init_tensor[k_idx, :, p_idx] = torch.from_numpy(pattern_resampled).float()
+                    else:
+                        print(f"⚠️ Pattern {key} is too short. Random init for this channel/atom.")
+                        Phi_init_tensor[k_idx, :, p_idx] = torch.randn(L)
+                else:
+                    # If the specific channel key is missing in JSON, init randomly
+                    # Only warns if K is small to avoid spamming console for large K
+                    if K <= 4:
+                        print(f"⚠️ Pattern key '{key}' missing. Random init for this channel/atom.")
+                    Phi_init_tensor[k_idx, :, p_idx] = torch.randn(L)
+        
+        Phi = Phi_init_tensor
+
+    # 4. Normalization and Perturbation
+    # Add small noise to break perfect symmetries if data is synthetic
+    Phi = Phi + torch.randn(K, L, P) * 0.1 
+    
+    # Normalize atoms to unit norm
+    Phi = unit_norm_atoms_(Phi)
+
+    # 5. Initialize other parameters
+    # Z: Sparse activations (initialized with small random values)
+    Z = torch.rand(S, K, N - L + 1).float() * 0.01 
+    
+    # A: Personalization weights (initialized to zero)
+    A = torch.zeros(S, K, M).float()
+
+    return Phi, Z, A
+
+def set_gait_informed_init(X, subjects, trial, K, L, M, signal_names, patterns_filepath):
+    """
+    Sets Phi from JSON patterns and Z from gait cycle indices.
+    """
+    S, N, P = X.shape
+    T_Z = N - L + 1
+    
+    # 1. Initialize Phi (K x L x P) from JSON
+    with open(patterns_filepath, 'r') as f:
+        raw_patterns = json.load(f)
+    
+    Phi = torch.zeros(K, L, P)
+    suffixes = ['Left', 'Right'] # Order based on your gait index function (Atom 0: L, Atom 1: R)
+
+    for k in range(K):
+        suffix = suffixes[k % 2]
+        for p, name in enumerate(signal_names):
+            key = f"{name}_{suffix}"
+            pattern = np.array(raw_patterns[key])
+            # Resample to length L
+            f_interp = interpolate.interp1d(np.arange(len(pattern)), pattern, kind='cubic')
+            Phi[k, :, p] = torch.from_numpy(f_interp(np.linspace(0, len(pattern) - 1, L))).float()
+
+    #Phi = Phi / (torch.norm(Phi, dim=(1, 2), keepdim=True) + 1e-8) # Simple Unit Norm
+    
+
+    # 2. Initialize Z (S x K x T_Z) from Gait Events
+    Z = torch.zeros(S, K, T_Z)
+    for s_idx, subj in enumerate(subjects):
+        left_idx, right_idx = get_gait_cycle_indices(subj, trial)
+        # Map Left to Atom 0, Right to Atom 1
+        for i in left_idx: 
+            if i < T_Z: Z[s_idx, 0, i] = 1.0
+        for i in right_idx: 
+            if i < T_Z and K > 1: Z[s_idx, 1, i] = 1.0
+
+    # 3. Initialize A (Personalization)
+    A = torch.zeros(S, K, M)
+
+    return Phi, Z, A
+
+
+#####################################################################
+#                                                                   #
+#                   Convolutional Sparse Coding                     #
+#                                                                   #
+#####################################################################
+
+def CSC_L0_DP(X, Z, phi, lam, eps_reg=1e-6):
+    """
+    Corrected CSC_L0 DP implementation following the paper's formulas.
+    X: (S, N, P)
+    Z: (S, K, T_Z) used only for shape
+    phi: (K, L, P)
+    lam: scalar (must be on same scale as ||P y||^2)
+    """
+    phi = orthogonalize_phi(phi)
+    S, N, P = X.shape
+    device = X.device
+    K, L, P_phi = phi.shape
+    assert P == P_phi
+    T_Z = N - L + 1
+
+    D_matrix = phi.reshape(K, L * P).T.to(device)  # (L*P) x K
+
+    G = D_matrix.T @ D_matrix  # K x K
+    reg = eps_reg * torch.eye(K, device=device)
+    try:
+        G_inv = torch.linalg.inv(G + reg)
+    except Exception:
+        G_inv = torch.linalg.pinv(G + reg)
+
+    P_tilde = G_inv @ D_matrix.T  # K x (L*P)
+
+    Z_out = torch.zeros(S, K, T_Z, device=device)
+
+    for s in range(S):
+        x_s = X[s]  # (N, P)
+        optimal_coeffs = torch.zeros(T_Z, K, device=device)
+        reconstruction_norm_sq = torch.zeros(T_Z, device=device)
+
+        for t in range(T_Z):
+            y_block = x_s[t:t+L, :].reshape(-1)
+            
+            # Unfiltered coefficients
+            u_t = P_tilde @ y_block
+
+            # Winner-takes-all selection
+            k_star = torch.argmax(torch.abs(u_t))
+            u_t_filtered = torch.zeros_like(u_t)
+            u_t_filtered[k_star] = u_t[k_star]
+
+            # Store filtered coefficients
+            optimal_coeffs[t] = u_t_filtered
+
+            # IMPORTANT: compute reconstruction with filtered coefficients
+            reconstruction = D_matrix @ u_t_filtered
+            reconstruction_norm_sq[t] = torch.sum(reconstruction ** 2)
+
+        segment_costs = lam - reconstruction_norm_sq  # length T_Z
+
+        V = torch.zeros(T_Z + 1, device=device)
+        t_prev_opt = torch.zeros(T_Z + 1, dtype=torch.long, device=device)
+
+        for t in range(L, T_Z + 1):
+            idx_Z = t - L
+            cost_no_activation = V[t - 1]
+            cost_with_activation = V[idx_Z] + segment_costs[idx_Z]
+            if cost_with_activation < cost_no_activation:
+                V[t] = cost_with_activation
+                t_prev_opt[t] = idx_Z  
+            else:
+                V[t] = cost_no_activation
+                t_prev_opt[t] = t_prev_opt[t - 1]
+
+        current_t = T_Z
+        while current_t >= L:
+            if t_prev_opt[current_t] == current_t - L:
+                t_start = current_t - L
+                Z_out[s, :, t_start] = optimal_coeffs[t_start].clamp(min=0.0)  # clamp if you want non-negativity
+                current_t = t_start
+            else:
+                current_t -= 1
+
+    return Z_out.detach()
+
+
+def CSC_L0_DP_AMO(X, Z, phi, lam):
+    """
+    Convolutional Sparse Coding (CSC) with AtMostOneActivation constraint.
+    (CSC-L0 regime 2 from Truong & Moreau, 2024)
+
+    Parameters:
+    - X: input signals (S x N x P)
+    - Z: activations (S x K x N-L+1) (Used for shape/dimension initialization only)
+    - phi: dictionary atoms (K x L x P)
+    - lam: L0 regularization parameter (lambda), threshold on squared correlation.
+
+    Returns:
+    - Z: The optimal activations (S x K x N-L+1), non-zero in at most one entry per column.
+    """
+
+    S, N, P = X.shape
+    device = X.device
+    K, L, P_phi = phi.shape
+    T_Z = N - L + 1
+    assert P == P_phi
+
+    D_matrix = phi.reshape(K, L * P).to(device)
+    
+    Z_out = torch.zeros(S, K, T_Z, device=device)
+
+    for s in range(S):
+        x_s = X[s].T.reshape(-1) # (P*N)
+        
+        correlations_sq = torch.zeros(T_Z, K, device=device) 
+        optimal_coeffs = torch.zeros(T_Z, K, device=device) # T_Z x K
+        
+        for t in range(T_Z):
+            y_block = x_s[t*P : (t+L)*P] 
+            
+            corr_k = torch.matmul(D_matrix, y_block) 
+            
+            optimal_coeffs[t] = corr_k.clamp(min=0.0) 
+            correlations_sq[t] = corr_k**2
+
+        max_corr_sq, best_k_idx = correlations_sq.max(dim=1)
+        
+        segment_costs = lam - max_corr_sq
+        
+        V = torch.zeros(T_Z + 1, device=device)
+        t_prev_opt = torch.zeros(T_Z + 1, dtype=torch.long, device=device) 
+        V[:L] = 0.0
+
+        for t in range(L, T_Z + 1):
+            idx_Z = t - L 
+            
+            cost_no_activation = V[t-1]
+            
+            cost_with_activation = V[idx_Z] + segment_costs[idx_Z]
+            
+            if cost_with_activation < cost_no_activation:
+                V[t] = cost_with_activation
+                t_prev_opt[t] = t - L 
+            else:
+                V[t] = cost_no_activation
+                t_prev_opt[t] = t_prev_opt[t-1] 
+
+        
+        current_t = T_Z
+        while current_t >= L:
+            if t_prev_opt[current_t] == current_t - L:
+                t_start = current_t - L
+                idx_Z = t_start
+                
+                best_k = best_k_idx[idx_Z]
+                
+                Z_out[s, best_k, idx_Z] = optimal_coeffs[idx_Z, best_k]
+                
+                current_t = t_start
+            else:
+                current_t -= 1
+    
+    return Z_out.detach()
+
+#####################################################################
+#                                                                   #
+#                  Convolutional dictionary update                  #
+#                                                                   #
+#####################################################################
+
+def CDU(X, Z, phi, n_iters=500, lr=5e-1):
+    """
+    Optimize phi with 0.5||X - sum_k z_k * phi_k||^2, s.t. ||phi_k||=1
+    X:   (S,N,P)
+    Z:   (S,K,T)
+    phi: (K,L,P)
+    returns: updated phi (K,L,P)
+    """
+    device = X.device
+    S, N, P = X.shape
+    K, L, P2 = phi.shape
+    assert P2 == P
+
+    X = to_tensor(X, device)
+    Z = to_tensor(Z, device)
+    phi = to_tensor(phi, device, requires_grad=True)
+    phi = torch.nn.Parameter(phi)
+
+    opt = torch.optim.Adam([phi], lr=lr)
+
+    for _ in range(n_iters):
+        opt.zero_grad()
+        X_hat = reconstruct_from_Z_phi(Z, phi, N)  # (S,N,P)
+        loss = 0.5 * torch.sum((X - X_hat) ** 2)
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            unit_norm_atoms_(phi)
+
+    return phi.detach()
+
+
+#####################################################################
+#                                                                   #
+#                    Transformation Function                        #
+#                                                                   #
+#####################################################################
+
+def time_warping_f(phi_k, a_k_s, sigma=0.1):
+    """
+    Time-warping 1D strict (interpolation linéaire)
+    Pas de grid_sample, pas de lissage transversal.
+    
+    phi_k: (L,P)
+    a_k_s: (M,)
+    return: (L,P)
+    """
+    L, P = phi_k.shape
+    M = a_k_s.shape[0]
+    device = phi_k.device
+
+    # timeline
+    t_i = torch.linspace(0, 1, L, device=device)
+
+    # Fourier-based displacement (comme ta version originale)
+    w = torch.arange(1, M + 1, device=device, dtype=torch.float32)
+    b_w = torch.sin(w[None, :] * math.pi * t_i[:, None]) / (w[None, :] * math.pi)
+    displacement = b_w @ a_k_s
+
+    # warp map
+    psi_a_t = torch.clamp(t_i + displacement, 0.0, 1.0)
+    x = psi_a_t * (L - 1)
+
+    # indices d'interpolation linéaire
+    x0 = torch.floor(x).long()
+    x1 = torch.clamp(x0 + 1, max=L - 1)
+    alpha = (x - x0.float()).unsqueeze(-1)   # (L,1)
+
+    # lookup propre, pas de broadcast bug
+    phi0 = phi_k[x0]          # (L,P)
+    phi1 = phi_k[x1]          # (L,P)
+
+    warped_phi = phi0 * (1 - alpha) + phi1 * alpha
+    return warped_phi
+
+
+
+#####################################################################
+#                                                                   #
+#                    Individual parameters update                   #
+#                                                                   #
+#####################################################################
+
+def IPU(X, Z, Phi, A, f=time_warping_f,n_iters=50, lr=1e-2, sigma=0.01):
+    """
+    IPU : optimize A (time-warp parameters) with
+    0.5 * ||X - sum_k z_k * f(phi_k, a_k^s)||^2
+
+    Inputs:
+        X:    (S, N, P)
+        Z:    (S, K, T)
+        Phi:  (K, L, P)
+        A:    (S, K, M)
+        f:    function (phi_k, a_k_s) -> (L, P)
+        n_iters: number of gradient steps
+        lr:   learning rate
+        sigma: smoothing param for f
+    Output:
+        A_new: updated A (S, K, M)
+    """
+    device = X.device
+    S, N, P = X.shape
+    S2, K, M = A.shape
+    K2, L, P2 = Phi.shape
+    assert S2 == S and K2 == K and P2 == P, "Shape mismatch between X, Phi, A"
+
+    X = X.to(device)
+    Z = Z.to(device)
+    Phi = Phi.to(device)
+    A = torch.nn.Parameter(A.clone().detach().to(device))
+
+    opt = torch.optim.Adam([A], lr=lr)
+
+    for _ in range(n_iters):
+        opt.zero_grad()
+
+        warped_Phi = torch.zeros((S, K, L, P), device=device)
+        for s in range(S):
+            for k in range(K):
+                warped_Phi[s, k] = f(Phi[k], A[s, k], sigma=sigma)
+
+        X_hat = torch.zeros((S, N, P), device=device)
+        for s in range(S):
+            weight = warped_Phi[s].permute(2, 0, 1).flip(-1).contiguous()  # (P,K,L)
+            X_hat[s] = F.conv1d(Z[s].unsqueeze(0), weight, padding=L - 1).permute(0, 2, 1)[0, :N, :]
+
+        loss = 0.5 * torch.sum((X - X_hat) ** 2)
+        loss.backward()
+        opt.step()
+
+    return A.detach()
+
+#####################################################################
+#                                                                   #
+#                          Personalized CDU                         #
+#                                                                   #
+#####################################################################
+    
+def inverse_warp_patch(y_patch, a_k_s, L=None):
+    """
+    Inverse-warp a single patch y_patch of shape (L, P) back to canonical frame.
+    Uses the same displacement basis as time_warping_f and numpy.interp to invert psi.
+    Returns aligned_patch (L, P) on same dtype/device as input.
+    """
+    # y_patch : (L, P) tensor
+    device = y_patch.device
+    dtype = y_patch.dtype
+    if L is None:
+        L = y_patch.shape[0]
+    M = a_k_s.shape[0]
+
+    # timeline [0,1]
+    t_i = torch.linspace(0.0, 1.0, L, device=device, dtype=dtype)
+
+    # build displacement like in time_warping_f
+    w = torch.arange(1, M + 1, device=device, dtype=dtype)
+    # b_w: (L, M)
+    b_w = torch.sin(w[None, :] * math.pi * t_i[:, None]) / (w[None, :] * math.pi)
+    displacement = b_w @ a_k_s  # (L,)
+
+    psi = torch.clamp(t_i + displacement, 0.0, 1.0)  # (L,)
+
+    # we'll invert psi: for canonical grid u_j = t_i we want t = psi^{-1}(u)
+    psi_cpu = psi.detach().cpu().numpy()
+    t_cpu = t_i.detach().cpu().numpy()
+    u_cpu = t_cpu  # same grid
+
+    # if psi not strictly monotonic, np.interp will still do something (piecewise)
+    t_of_u = np.interp(u_cpu, psi_cpu, t_cpu)  # gives t corresponding to each u
+
+    # map to sample locations in [0, L-1]
+    x = t_of_u * (L - 1)  # float positions
+    # linear interpolation of y_patch along axis 0
+    y_np = y_patch.detach().cpu().numpy()  # (L, P)
+    L_int, P = y_np.shape
+
+    # sample for each dim p
+    aligned = np.empty((L, P), dtype=y_np.dtype)
+    x0 = np.floor(x).astype(int)
+    x1 = np.clip(x0 + 1, 0, L_int - 1)
+    alpha = (x - x0).reshape(-1, 1)
+
+    aligned = (1.0 - alpha) * y_np[x0, :] + alpha * y_np[x1, :]
+
+    aligned_t = torch.from_numpy(aligned).to(device=device, dtype=dtype)
+    return aligned_t
+
+
+def PerCDU(X, Z, phi, A, alpha_blend=0.02, lambda_reg=5e-3):
+    """
+    PerCDU stable sans min_count_threshold.
+    
+    X : (S,N,P)
+    Z : (S,K,T)
+    phi : (K,L,P)
+    A : (S,K,M)
+    func : time-warping function f(phi_k, a_sk)
+    alpha_blend : blending step to control atom drift
+    lambda_reg : ridge regularization toward previous phi
+    
+    Retourne :
+        final_phi : (K,L,P)  (detach, normalized)
+    """
+    device = X.device
+    dtype  = X.dtype
+
+    S, N, P = X.shape
+    K, L, P2 = phi.shape
+    assert P2 == P
+
+    X_t  = X.to(device)
+    Z_t  = Z.to(device)
+    A_t  = A.to(device)
+    phi_old = phi.to(device)
+
+    new_phi_est = torch.zeros_like(phi_old, device=device, dtype=dtype)
+
+    T = Z_t.shape[2]  # T = N - L + 1
+
+    # ---- Compute new phi (closed-form average of inverse-warped patches) ----
+    for k in range(K):
+        numer = torch.zeros((L, P), device=device, dtype=dtype)
+        denom = 0.0
+
+        for s in range(S):
+            z_sk = Z_t[s, k]  # (T,)
+            idxs = torch.nonzero(z_sk > 0, as_tuple=False).squeeze(-1)
+            if idxs.numel() == 0:
+                continue
+
+            a_sk = A_t[s, k]  # (M,)
+
+            for t_idx in idxs.tolist():
+                start = t_idx
+                end = t_idx + L
+                if end > N:
+                    continue
+                y_patch = X_t[s, start:end, :]    # (L, P)
+
+                aligned = inverse_warp_patch(y_patch, a_sk, L=L)  # (L,P)
+
+                weight = float(z_sk[t_idx].detach().cpu().item())
+                numer += weight * aligned
+                denom += weight
+
+        # ---- Regularization towards old phi ----
+        if denom > 0:
+            numer = numer + lambda_reg * phi_old[k]
+            denom = denom + lambda_reg
+
+            new_phi_est[k] = numer / (denom + 1e-12)
+        else:
+            # no occurrences: keep the previous atom
+            new_phi_est[k] = phi_old[k].clone()
+
+    # ---- Normalize new_phi_est ----
+    norms = new_phi_est.view(K, -1).norm(p=2, dim=1).view(K, 1, 1)
+    norms = torch.clamp(norms, min=1e-12)
+    new_phi_est = new_phi_est / norms
+
+    # ---- Blend with previous atoms (stabilization) ----
+    final_phi = (1.0 - alpha_blend) * phi_old + alpha_blend * new_phi_est
+
+    # ---- Normalize final phi ----
+    norms = final_phi.view(K, -1).norm(p=2, dim=1).view(K, 1, 1)
+    norms = torch.clamp(norms, min=1e-12)
+    final_phi = final_phi / norms
+
+    return final_phi.detach()
+
+
+#####################################################################
+#                                                                   #
+#                          Personalized CDL                         #
+#                                                                   #
+#####################################################################
+
+
+def PerCDL(X,nb_atoms=2,D=3,W=10,atoms_length=50,func=time_warping_f,lambda_=0.01,n_iters=100,n_perso=100,signal_names=None,seed=None):
+    
+    K = nb_atoms
+    L = atoms_length
+    M=D*W
+
+    Phi, Z, A = setInitialValues_pers(X,K,M,L,signal_names=signal_names,seed=seed)
+ 
+
+    for it in range(n_iters):
+        Z = CSC_L0_DP(X, Z, Phi, lambda_)
+        Phi = CDU(X, Z, Phi,lr=5e-2)
+
+
+    for it in range(n_perso):
+        A = IPU(X, Z, Phi, A,f=func)
+        Z = CSC_L0_DP(X, Z, Phi, lambda_)
+        Phi = PerCDU(X, Z, Phi, A)
+
+    return A,Z,Phi
+
+def Personalization(X,A,Z,Phi,lambda_=0.01,func=time_warping_f,n_perso=100):
+
+    for it in range(n_perso):
+        A = IPU(X, Z, Phi, A,f=func)
+        Z = CSC_L0_DP(X, Z, Phi, lambda_)
+        Phi = PerCDU(X, Z, Phi, A)
+
+    return A,Z,Phi
+
+#####################################################################
+#                                                                   #
+#                                CDL                                #
+#                                                                   #
+#####################################################################
+
+def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100,signal_names=None,seed=None):
+    
+    K = nb_atoms
+    L = atoms_length
+    M=D*W
+
+    #Phi, Z, A = setInitialValues_pers(X,K,M,L,signal_names=signal_names,seed=seed)
+    Phi, Z, A = set_gait_informed_init(X, list(range(1, 11)), 1, K, L, M, signal_names, 'patterns_bruts_sujet_1_essai_1.json')
+
+    for it in range(n_iters):
+        Z = CSC_L0_DP(X, Z, Phi, lambda_)
+        Phi = CDU(X, Z, Phi,lr=5e-2)
+
+    return Z,Phi,A
+
+
+#####################################################################
+#                                                                   #
+#                         Preprocessing                             #
+#                                                                   #
+#####################################################################
+
+
+def apply_low_pass(X, cutoff, fs, order=5):
+    """
+    Applies a zero-phase Butterworth low-pass filter.
+    Handles both a global cutoff (scalar) or specific cutoffs per signal (S x P).
+    """
+    S, N, P = X.shape
+    nyq = 0.5 * fs
+    
+    # Check if cutoff is an array matching (S, P)
+    if hasattr(cutoff, 'shape') and cutoff.shape == (S, P):
+        # Case A: Unique cutoff per signal -> We must loop
+        y = np.zeros_like(X)
+        
+        for s in range(S):
+            for p in range(P):
+                # 1. Get the specific cutoff for this signal
+                c = cutoff[s, p]
+                
+                # 2. Safety check: avoid invalid cutoffs (0 or >= Nyquist)
+                if c <= 0 or c >= nyq:
+                    # If invalid, just copy original data (or raise error)
+                    y[s, :, p] = X[s, :, p]
+                    continue
+
+                # 3. Design the filter SPECIFIC to this signal
+                normal_cutoff = c / nyq
+                b, a = butter(order, normal_cutoff, btype='low', analog=False)
+                
+                # 4. Apply filter to this 1D time series
+                y[s, :, p] = filtfilt(b, a, X[s, :, p])
+                
+        return y
+
+    # Case B: Global cutoff (scalar) -> Vectorized (Much faster)
+    else:
+        # Ensure cutoff is a float just in case
+        c = float(cutoff)
+        normal_cutoff = c / nyq
+        b, a = butter(order, normal_cutoff, btype='low', analog=False)
+        
+        # Apply along axis 1 (Time)
+        return filtfilt(b, a, X, axis=1)
+
+def find_optimal_cutoff(X, fs, percentile=0.95, subject=None):
+    """
+    Estimates the optimal cutoff frequency based on Cumulative Power.
+    Generalized for any number of channels P.
+    
+    Parameters:
+    - X (np.array): Data of shape (S, N, P)
+    - fs (float): Sampling frequency (Hz)
+    - percentile (float or list): Fraction of energy to keep. 
+                                  If float (e.g., 0.95), applies to all channels.
+                                  If list, must be length P.
+    - subject (int, optional): If provided, plots the PSD and cutoff for this subject.
+    
+    Returns:
+    - cutoff_freqs (np.array): Array of shape (S, P) containing cutoff frequencies.
+    """
+    S, N, P = X.shape
+
+    # 1. Handle Percentile Logic
+    # If it's a single float, replicate it for all P channels.
+    if isinstance(percentile, (float, int)):
+        percentile = [percentile] * P
+    elif len(percentile) != P:
+        raise ValueError(f"Percentile list length ({len(percentile)}) must match number of channels P={P}.")
+
+    # 2. Compute PSD using Welch's method
+    # axis=1 is the time dimension (N). Result shape: (S, Frequency_Bins, P)
+    freqs, psd = welch(X, fs=fs, nperseg=min(N, 256), axis=1)
+
+    # 3. Transpose to (S, P, Frequency_Bins) for easier broadcasting
+    psd_processed = np.transpose(psd, (0, 2, 1))
+
+    # 4. Calculate Cumulative Distribution of Power
+    psd_cumsum = np.cumsum(psd_processed, axis=-1)
+    
+    # Normalize by total power (last value of cumsum)
+    total_power = psd_cumsum[..., -1:]
+    # Avoid division by zero
+    total_power[total_power == 0] = 1.0 
+    psd_normalized = psd_cumsum / total_power
+    
+    # 5. Find indices where we cross the percentile threshold
+    # We construct a (S, P) array of indices
+    cutoff_indices = np.zeros((S, P), dtype=int)
+    
+    for s in range(S):
+        for p in range(P):
+            # argmax returns the first index where condition is True
+            cutoff_indices[s, p] = np.argmax(psd_normalized[s, p, :] >= percentile[p])
+    
+    # 6. Convert indices to actual Frequencies
+    cutoff_freqs = freqs[cutoff_indices] # Shape (S, P)
+
+    # 7. Visualization (if subject is specified)
+    if subject is not None:
+        if subject >= S:
+            print(f"Error: Subject {subject} out of bounds (max {S-1}).")
+            return cutoff_freqs
+
+        print(f"--- PSD and Cutoff Frequencies for Subject {subject} ---")
+        
+        cutoff_s = cutoff_freqs[subject] # Shape (P,)
+        
+        # squeeze=False ensures axs is always iterable (even if P=1)
+        fig, axs = plt.subplots(P, 1, figsize=(10, 3 * P), constrained_layout=True, squeeze=False)
+        
+        for p in range(P):
+            ax = axs[p, 0]
+            
+            # Plot PSD for this channel
+            # psd shape is (S, Freqs, P), so we want psd[subject, :, p]
+            ax.plot(freqs, psd[subject, :, p], label='PSD', color='tab:blue')
+            
+            # Plot Cutoff line
+            c_freq = cutoff_s[p]
+            ax.axvline(c_freq, color='tab:red', linestyle='--', linewidth=1.5, label=f'Cutoff ({percentile[p]*100:.0f}%)')
+            
+            ax.set_title(f'Channel {p} - Cutoff: {c_freq:.2f} Hz')
+            ax.set_ylabel('Power Density (V²/Hz)')
+            ax.legend(loc='upper right')
+            ax.grid(True, linestyle=':', alpha=0.6)
+            
+            # Only set xlabel for the bottom plot to reduce clutter
+            if p == P - 1:
+                ax.set_xlabel('Frequency (Hz)')
+
+        plt.show()
+    
+    return cutoff_freqs
+
+
+def create_initial_Z_from_events(subjects, trial, num_atoms, N, L, device='cpu'):
+    """
+    Creates a Z tensor initialized with 1.0 at the start of each gait cycle.
+    
+    K: number of atoms (should be 2)
+    N: length of the signal (min_len from build_X)
+    L: length of the atoms
+    """
+    T_Z = N - L + 1
+    S = len(subjects)
+    K = num_atoms
+    
+    # Initialize with zeros
+    Z_init = torch.zeros((S, K, T_Z), device=device)
+    
+    for s_idx, subj in enumerate(subjects):
+        # Get your index lists from the function we made earlier
+        left_indices, right_indices = get_gait_cycle_indices(subj, trial)
+        
+        # Fill Left Foot Events (Atom 0)
+        for idx in left_indices:
+            if idx < T_Z: # Ensure index fits in the activation map
+                Z_init[s_idx, 0, idx] = 1.0
+                
+        # Fill Right Foot Events (Atom 1)
+        if K >= 2:
+            for idx in right_indices:
+                if idx < T_Z:
+                    Z_init[s_idx, 1, idx] = 1.0
+                    
+    return Z_init
