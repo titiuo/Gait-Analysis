@@ -270,7 +270,7 @@ def set_gait_informed_init(X, subjects, trial, K, L, M, signal_names, patterns_f
             # Resample to length L
             f_interp = interpolate.interp1d(np.arange(len(pattern)), pattern, kind='cubic')
             Phi[k, :, p] = torch.from_numpy(f_interp(np.linspace(0, len(pattern) - 1, L))).float()
-
+            Phi[k, :, p] = Phi[k, :, p] - Phi[k, :, p].mean()
     #Phi = Phi / (torch.norm(Phi, dim=(1, 2), keepdim=True) + 1e-8) # Simple Unit Norm
     
 
