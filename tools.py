@@ -290,6 +290,7 @@ def set_gait_informed_init(X, subjects, trial, K, L, M, signal_names, patterns_f
     return Phi, Z, A
 
 
+
 #####################################################################
 #                                                                   #
 #                   Convolutional Sparse Coding                     #
@@ -773,14 +774,19 @@ def Personalization(X,A,Z,Phi,lambda_=0.01,func=time_warping_f,n_perso=100):
 #                                                                   #
 #####################################################################
 
-def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100,signal_names=None,seed=None):
+def CDL(X,nb_atoms,D=3,W=10,atoms_length=50,lambda_=0.01,n_iters=100,signal_names=None,seed=None,init:list=None):
     
     K = nb_atoms
     L = atoms_length
     M=D*W
 
-    #Phi, Z, A = setInitialValues_pers(X,K,M,L,signal_names=signal_names,seed=seed)
-    Phi, Z, A = set_gait_informed_init(X, list(range(1, 11)), 1, K, L, M, signal_names, 'patterns_bruts_sujet_1_essai_1.json')
+    
+    if init is None:
+        #Phi, Z, A = setInitialValues_pers(X,K,M,L,signal_names=signal_names,seed=seed)
+        Phi, Z, A = set_gait_informed_init(X, list(range(1, 11)), 1, K, L, M, signal_names, 'patterns_bruts_sujet_1_essai_1.json')
+
+    else:
+        Phi, Z, A = init
 
     for it in range(n_iters):
         Z = CSC_L0_DP(X, Z, Phi, lambda_)
